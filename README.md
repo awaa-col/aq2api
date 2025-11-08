@@ -134,13 +134,20 @@ python3 test_multi_account.py
   "client_secret": "your_client_secret",
   "refresh_token": "your_refresh_token",
   "access_token": "will_be_auto_updated",
-  "region": "us-east-1",//改为你自己账号对应的地区
+  "region": "us-east-1"
 }
 ```
+
+参考示例文件：`amazonq_credentials.example.json`
 
 ## 配置文件
 
 创建 `config.json` 文件来自定义服务行为。
+
+### 示例配置文件
+
+- **单账号**: 参考 `config.example.json`
+- **多账号**: 参考 `config.multi-account.example.json`
 
 ### 默认配置
 

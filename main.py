@@ -64,10 +64,11 @@ TOKEN_REFRESH_MARGIN = CONFIG.get("performance", {}).get("token_refresh_margin_s
 
 
 class AmazonQAuthManager:
-    """Amazon Q OAuth 认证管理器"""
+    """Amazon Q OAuth 认证管理器 - 支持多账号轮询"""
 
-    def __init__(self, credentials_path: str = "amazonq_credentials.json"):
+    def __init__(self, credentials_path: str = "amazonq_credentials.json", account_index: int = 0):
         self.credentials_path = credentials_path
+        self.account_index = account_index
         self.access_token = None
         self.token_expiry = None
         self.credentials = self._load_credentials()
@@ -75,7 +76,7 @@ class AmazonQAuthManager:
         if self.credentials.get('access_token'):
             self.access_token = self.credentials['access_token']
             if log_config.get("log_token_refresh", True):
-                logger.info(f"✓ 从配置文件加载 access_token (长度: {len(self.access_token)})")
+                logger.info(f"✓ 账号 #{account_index} 从配置文件加载 access_token (长度: {len(self.access_token)})")
 
     def _load_credentials(self) -> Dict:
         """加载凭证"""
@@ -563,9 +564,112 @@ class OpenAIConverter:
         return f"data: {json.dumps(chunk)}\n\n"
 
 
+# 多账号管理器
+class MultiAccountManager:
+    """多账号轮询管理器 - 支持健康追踪和自动重试"""
+    
+    def __init__(self):
+        self.accounts = []
+        self.current_index = 0
+        self.account_health = {}  # 账号健康状态追踪
+        self.load_accounts()
+    
+    def load_accounts(self):
+        """加载所有账号配置"""
+        # 清空现有账号
+        self.accounts = []
+        self.account_health = {}
+        
+        # 支持多种配置方式：
+        # 1. 单个文件 amazonq_credentials.json
+        # 2. 多个文件 amazonq_credentials_0.json, amazonq_credentials_1.json, ...
+        # 3. 在 config.json 中配置 accounts 数组
+        
+        config_accounts = CONFIG.get("accounts", [])
+        
+        if config_accounts:
+            # 从 config.json 加载账号配置
+            for idx, account_config in enumerate(config_accounts):
+                if isinstance(account_config, str):
+                    # 如果是字符串，作为文件路径
+                    if os.path.exists(account_config):
+                        auth_mgr = AmazonQAuthManager(account_config, idx)
+                        self.accounts.append(auth_mgr)
+                        self.account_health[idx] = {"errors": 0, "last_error": None}
+                        logger.info(f"✓ 加载账号 #{idx} 从文件: {account_config}")
+                elif isinstance(account_config, dict):
+                    # 如果是字典，直接使用配置
+                    temp_path = f"amazonq_credentials_{idx}.json"
+                    with open(temp_path, 'w') as f:
+                        json.dump(account_config, f, indent=2)
+                    auth_mgr = AmazonQAuthManager(temp_path, idx)
+                    self.accounts.append(auth_mgr)
+                    self.account_health[idx] = {"errors": 0, "last_error": None}
+                    logger.info(f"✓ 加载账号 #{idx} 从配置")
+        else:
+            # 自动发现账号文件
+            # 首先尝试默认文件
+            if os.path.exists("amazonq_credentials.json"):
+                auth_mgr = AmazonQAuthManager("amazonq_credentials.json", 0)
+                self.accounts.append(auth_mgr)
+                self.account_health[0] = {"errors": 0, "last_error": None}
+                logger.info(f"✓ 加载账号 #0 从文件: amazonq_credentials.json")
+            
+            # 然后尝试编号文件
+            idx = 0
+            while True:
+                cred_file = f"amazonq_credentials_{idx}.json"
+                if os.path.exists(cred_file):
+                    auth_mgr = AmazonQAuthManager(cred_file, idx)
+                    self.accounts.append(auth_mgr)
+                    self.account_health[idx] = {"errors": 0, "last_error": None}
+                    logger.info(f"✓ 加载账号 #{idx} 从文件: {cred_file}")
+                    idx += 1
+                else:
+                    break
+        
+        if not self.accounts:
+            logger.warning("未找到任何账号配置")
+    
+    def get_next_account(self) -> AmazonQAuthManager:
+        """获取下一个账号（轮询策略）"""
+        if not self.accounts:
+            raise ValueError("没有可用的账号配置")
+        
+        # 轮询选择
+        account = self.accounts[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.accounts)
+        
+        if log_config.get("log_requests", True):
+            logger.info(f"使用账号 #{account.account_index} (共 {len(self.accounts)} 个账号)")
+        
+        return account
+    
+    def mark_account_error(self, account_index: int, error: str):
+        """标记账号错误"""
+        if account_index in self.account_health:
+            self.account_health[account_index]["errors"] += 1
+            self.account_health[account_index]["last_error"] = error
+            logger.warning(f"账号 #{account_index} 出现错误 (累计: {self.account_health[account_index]['errors']}): {error}")
+    
+    def mark_account_success(self, account_index: int):
+        """标记账号成功（重置错误计数）"""
+        if account_index in self.account_health:
+            if self.account_health[account_index]["errors"] > 0:
+                self.account_health[account_index]["errors"] = 0
+                self.account_health[account_index]["last_error"] = None
+                logger.info(f"账号 #{account_index} 恢复正常")
+    
+    def get_account_count(self) -> int:
+        """获取账号数量"""
+        return len(self.accounts)
+    
+    def get_health_status(self) -> Dict:
+        """获取所有账号的健康状态"""
+        return self.account_health.copy()
+
 # 全局实例
-auth_manager = AmazonQAuthManager()
-amazonq_client = AmazonQClient(auth_manager)
+multi_account_manager = MultiAccountManager()
 converter = OpenAIConverter()
 
 
@@ -607,34 +711,61 @@ def _handle_chat_request(format_type: str = "openai"):
         # 生成会话 ID
         conversation_id = str(uuid.uuid4())
 
-        # 调用 Amazon Q
-        try:
-            # 支持通过 model 参数指定 model_id
-            model_id = "claude-sonnet-4.5"
-            if model in ["claude-sonnet-4.5", "claude-sonnet-4", "amazon-q"]:
-                if model == "claude-sonnet-4.5":
-                    model_id = "claude-sonnet-4.5"
-                elif model == "claude-sonnet-4":
-                    model_id = "claude-sonnet-4"
+        # 调用 Amazon Q - 使用多账号轮询，支持自动重试
+        max_retries = min(3, multi_account_manager.get_account_count())  # 最多重试账号数或3次
+        last_error = None
+        
+        for attempt in range(max_retries):
+            try:
+                # 获取下一个可用账号
+                auth_manager = multi_account_manager.get_next_account()
+                amazonq_client = AmazonQClient(auth_manager)
+                
+                # 支持通过 model 参数指定 model_id
+                model_id = "claude-sonnet-4.5"
+                if model in ["claude-sonnet-4.5", "claude-sonnet-4", "amazon-q"]:
+                    if model == "claude-sonnet-4.5":
+                        model_id = "claude-sonnet-4.5"
+                    elif model == "claude-sonnet-4":
+                        model_id = "claude-sonnet-4"
 
-            amazonq_response = amazonq_client.send_message(
-                message=content,
-                conversation_id=conversation_id,
-                profile_arn=auth_manager.credentials.get('profile_arn'),
-                model_id=model_id,
-                stream=stream  # 传递 stream 参数
-            )
-            if not stream and log_config.get("log_responses", True):
-                logger.info(f"Amazon Q 响应长度: {len(amazonq_response)}")
-        except Exception as e:
-            logger.error(f"调用 Amazon Q 失败: {e}")
-            return jsonify({
-                "error": {
-                    "message": f"Amazon Q API 调用失败: {str(e)}",
-                    "type": "amazon_q_error",
-                    "code": "service_unavailable"
-                }
-            }), 503
+                amazonq_response = amazonq_client.send_message(
+                    message=content,
+                    conversation_id=conversation_id,
+                    profile_arn=auth_manager.credentials.get('profile_arn'),
+                    model_id=model_id,
+                    stream=stream  # 传递 stream 参数
+                )
+                
+                # 请求成功，标记账号健康
+                multi_account_manager.mark_account_success(auth_manager.account_index)
+                
+                if not stream and log_config.get("log_responses", True):
+                    logger.info(f"Amazon Q 响应长度: {len(amazonq_response)}")
+                
+                # 成功，跳出重试循环
+                break
+                
+            except Exception as e:
+                last_error = e
+                # 标记账号错误
+                multi_account_manager.mark_account_error(auth_manager.account_index, str(e))
+                logger.error(f"账号 #{auth_manager.account_index} 调用失败 (尝试 {attempt + 1}/{max_retries}): {e}")
+                
+                # 如果还有重试机会，继续下一个账号
+                if attempt < max_retries - 1:
+                    logger.info(f"尝试下一个账号...")
+                    continue
+                else:
+                    # 所有账号都失败了
+                    logger.error(f"所有账号调用均失败: {last_error}")
+                    return jsonify({
+                        "error": {
+                            "message": "Amazon Q API 暂时不可用，请稍后重试",
+                            "type": "amazon_q_error",
+                            "code": "service_unavailable"
+                        }
+                    }), 503
 
         # 转换响应
         if stream:
@@ -773,23 +904,54 @@ def list_models():
 
 @app.route('/credentials', methods=['POST'])
 def set_credentials():
-    """设置 Amazon Q 凭证"""
+    """设置 Amazon Q 凭证（支持多账号）"""
     try:
         credentials = request.json
-        required_fields = ['refresh_token', 'client_id', 'client_secret']
-
-        for field in required_fields:
-            if field not in credentials:
-                return jsonify({
-                    "error": f"缺少必需字段: {field}"
-                }), 400
-
-        auth_manager.set_credentials(credentials)
-
-        return jsonify({
-            "message": "凭证设置成功",
-            "has_profile_arn": bool(credentials.get('profile_arn'))
-        })
+        
+        # 检查是否是批量设置多个账号
+        if isinstance(credentials, list):
+            # 批量设置多个账号
+            for idx, cred in enumerate(credentials):
+                required_fields = ['refresh_token', 'client_id', 'client_secret']
+                for field in required_fields:
+                    if field not in cred:
+                        return jsonify({
+                            "error": f"账号 #{idx} 缺少必需字段: {field}"
+                        }), 400
+                
+                # 保存到文件
+                cred_file = f"amazonq_credentials_{idx}.json"
+                with open(cred_file, 'w') as f:
+                    json.dump(cred, f, indent=2)
+            
+            # 重新加载账号
+            multi_account_manager.load_accounts()
+            
+            return jsonify({
+                "message": f"成功设置 {len(credentials)} 个账号",
+                "account_count": multi_account_manager.get_account_count()
+            })
+        else:
+            # 单个账号设置
+            required_fields = ['refresh_token', 'client_id', 'client_secret']
+            for field in required_fields:
+                if field not in credentials:
+                    return jsonify({
+                        "error": f"缺少必需字段: {field}"
+                    }), 400
+            
+            # 保存到默认文件
+            with open("amazonq_credentials.json", 'w') as f:
+                json.dump(credentials, f, indent=2)
+            
+            # 重新加载账号
+            multi_account_manager.load_accounts()
+            
+            return jsonify({
+                "message": "凭证设置成功",
+                "has_profile_arn": bool(credentials.get('profile_arn')),
+                "account_count": multi_account_manager.get_account_count()
+            })
     except Exception as e:
         logger.error(f"设置凭证失败: {e}")
         return jsonify({"error": str(e)}), 500
@@ -797,44 +959,75 @@ def set_credentials():
 
 @app.route('/credentials', methods=['GET'])
 def get_credentials_status():
-    """获取凭证状态"""
-    has_credentials = bool(auth_manager.credentials.get('refresh_token'))
-    has_token = bool(auth_manager.access_token)
-
+    """获取凭证状态（多账号）"""
+    accounts_status = []
+    health_status = multi_account_manager.get_health_status()
+    
+    for account in multi_account_manager.accounts:
+        has_credentials = bool(account.credentials.get('refresh_token'))
+        has_token = bool(account.access_token)
+        health = health_status.get(account.account_index, {})
+        
+        accounts_status.append({
+            "account_index": account.account_index,
+            "credentials_file": account.credentials_path,
+            "has_credentials": has_credentials,
+            "has_access_token": has_token,
+            "token_expiry": account.token_expiry.isoformat() if account.token_expiry else None,
+            "health": {
+                "error_count": health.get("errors", 0),
+                "last_error": health.get("last_error")
+            }
+        })
+    
     return jsonify({
-        "has_credentials": has_credentials,
-        "has_access_token": has_token,
-        "token_expiry": auth_manager.token_expiry.isoformat() if auth_manager.token_expiry else None
+        "account_count": multi_account_manager.get_account_count(),
+        "current_index": multi_account_manager.current_index,
+        "accounts": accounts_status
     })
 
 
 @app.route('/test/token', methods=['GET'])
 def test_token():
-    """测试 token 刷新功能"""
+    """测试 token 刷新功能（多账号）"""
     try:
         logger.info("=" * 50)
-        logger.info("开始测试 token 刷新")
+        logger.info("开始测试所有账号的 token 刷新")
         logger.info("=" * 50)
 
-        # 强制刷新 token
-        auth_manager.access_token = None
-        auth_manager.token_expiry = None
+        results = []
+        for account in multi_account_manager.accounts:
+            try:
+                # 强制刷新 token
+                account.access_token = None
+                account.token_expiry = None
 
-        access_token = auth_manager.get_access_token()
+                access_token = account.get_access_token()
+
+                results.append({
+                    "account_index": account.account_index,
+                    "success": True,
+                    "token_preview": access_token[:30] + "..." if len(access_token) > 30 else access_token,
+                    "token_length": len(access_token),
+                    "token_expiry": account.token_expiry.isoformat() if account.token_expiry else None
+                })
+            except Exception as e:
+                logger.error(f"账号 #{account.account_index} token 测试失败: {e}")
+                results.append({
+                    "account_index": account.account_index,
+                    "success": False,
+                    "error": "Token 刷新失败"
+                })
 
         return jsonify({
-            "success": True,
-            "message": "Token 刷新成功",
-            "token_preview": access_token[:30] + "..." if len(access_token) > 30 else access_token,
-            "token_length": len(access_token),
-            "token_expiry": auth_manager.token_expiry.isoformat() if auth_manager.token_expiry else None
+            "account_count": len(results),
+            "results": results
         })
     except Exception as e:
         logger.error(f"Token 测试失败: {e}", exc_info=True)
         return jsonify({
             "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__
+            "error": "测试过程中发生错误"
         }), 500
 
 
@@ -844,7 +1037,8 @@ def health():
     return jsonify({
         "status": "ok",
         "timestamp": datetime.utcnow().isoformat(),
-        "has_credentials": bool(auth_manager.credentials.get('refresh_token'))
+        "account_count": multi_account_manager.get_account_count(),
+        "has_credentials": multi_account_manager.get_account_count() > 0
     })
 
 
@@ -853,8 +1047,10 @@ def index():
     """首页"""
     return jsonify({
         "message": "Amazon Q to OpenAI API Bridge",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "auth_method": "OAuth 2.0",
+        "features": ["multi-account-polling"],
+        "account_count": multi_account_manager.get_account_count(),
         "endpoints": {
             "openai_chat": "/v1/chat/completions",
             "anthropic_messages": "/v1/messages",
@@ -867,13 +1063,14 @@ def index():
 
 
 if __name__ == '__main__':
-    logger.info("启动 Amazon Q to OpenAI API Bridge")
+    logger.info("启动 Amazon Q to OpenAI API Bridge (多账号版本)")
     logger.info(f"Amazon Q 端点: {AMAZONQ_ENDPOINT}")
     logger.info(f"SSO OIDC 端点: {SSO_OIDC_ENDPOINT}")
 
     # 检查是否已有凭证
-    if auth_manager.credentials.get('refresh_token'):
-        logger.info("✓ 已加载 Amazon Q 凭证")
+    account_count = multi_account_manager.get_account_count()
+    if account_count > 0:
+        logger.info(f"✓ 已加载 {account_count} 个 Amazon Q 账号")
     else:
         logger.warning("✗ 未找到凭证，请通过 POST /credentials 设置")
 

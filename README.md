@@ -70,6 +70,14 @@ curl -X POST http://localhost:8000/credentials \
 2. 账号索引自动循环，均匀分配负载
 3. 所有账号的 token 独立管理和刷新
 
+### 自动故障转移
+
+系统支持账号健康追踪和自动故障转移：
+- **健康追踪**: 记录每个账号的错误次数和最后错误信息
+- **自动重试**: 如果当前账号请求失败，自动尝试下一个账号
+- **最多重试**: 默认最多重试 3 次或所有可用账号数（取较小值）
+- **恢复检测**: 账号请求成功后自动重置错误计数
+
 ### 查看账号状态
 
 ```bash
@@ -87,17 +95,33 @@ curl http://localhost:8000/credentials
       "credentials_file": "amazonq_credentials.json",
       "has_credentials": true,
       "has_access_token": true,
-      "token_expiry": "2025-11-08T17:00:00"
+      "token_expiry": "2025-11-08T17:00:00",
+      "health": {
+        "error_count": 0,
+        "last_error": null
+      }
     },
     {
       "account_index": 1,
       "credentials_file": "amazonq_credentials_1.json",
       "has_credentials": true,
       "has_access_token": true,
-      "token_expiry": "2025-11-08T17:05:00"
+      "token_expiry": "2025-11-08T17:05:00",
+      "health": {
+        "error_count": 2,
+        "last_error": "Token expired"
+      }
     }
   ]
 }
+```
+
+### 测试多账号功能
+
+运行测试脚本验证多账号轮询功能：
+
+```bash
+python3 test_multi_account.py
 ```
 
 ## 凭证文件格式

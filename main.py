@@ -758,10 +758,10 @@ def _handle_chat_request(format_type: str = "openai"):
                     continue
                 else:
                     # 所有账号都失败了
-                    logger.error(f"所有账号调用均失败")
+                    logger.error(f"所有账号调用均失败: {last_error}")
                     return jsonify({
                         "error": {
-                            "message": f"Amazon Q API 调用失败: {str(last_error)}",
+                            "message": "Amazon Q API 暂时不可用，请稍后重试",
                             "type": "amazon_q_error",
                             "code": "service_unavailable"
                         }
@@ -1016,8 +1016,7 @@ def test_token():
                 results.append({
                     "account_index": account.account_index,
                     "success": False,
-                    "error": str(e),
-                    "error_type": type(e).__name__
+                    "error": "Token 刷新失败"
                 })
 
         return jsonify({
@@ -1028,8 +1027,7 @@ def test_token():
         logger.error(f"Token 测试失败: {e}", exc_info=True)
         return jsonify({
             "success": False,
-            "error": str(e),
-            "error_type": type(e).__name__
+            "error": "测试过程中发生错误"
         }), 500
 
 
